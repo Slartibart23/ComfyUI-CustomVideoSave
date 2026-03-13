@@ -3,6 +3,12 @@ ComfyUI Custom Node: Video Combine (Custom Path)
 Basierend auf der Idee von comfyui-videohelpersuite "Video Combine",
 aber mit der Möglichkeit, in beliebige Ordner/Laufwerke zu speichern.
 
+Features:
+- Beliebiger Ausgabepfad (auch andere Laufwerke)
+- Optionale Metadata-Speicherung (JSON)
+- Video-Preview im ComfyUI-Interface
+- Workflow als PNG speichern (mit eingebettetem Workflow)
+
 Kompatibel mit Python 3.11.9 und ComfyUI.
 """
 
@@ -15,6 +21,7 @@ import json
 import numpy as np
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 import torch
 
@@ -59,6 +66,81 @@ class VideoCombineCustomPath:
             },
             "optional": {
                 "audio": ("AUDIO",),
+                # --- Metadata ---
+                "save_metadata": ("BOOLEAN", {
+                    "default": True,
+                }),
+                "meta_model_name": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "z.B. WAN2.1, SVD, AnimateDiff ...",
+                }),
+                "meta_positive_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Positive Prompt",
+                }),
+                "meta_negative_prompt": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Negative Prompt",
+                }),
+                "meta_lora_name": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "z.B. Sus4nn3_WAN22_02",
+                }),
+                "meta_lora_strength": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 5.0,
+                    "step": 0.05,
+                }),
+                "meta_steps": ("INT", {
+                    "default": 20,
+                    "min": 1,
+                    "max": 200,
+                }),
+                "meta_cfg": ("FLOAT", {
+                    "default": 7.0,
+                    "min": 0.0,
+                    "max": 30.0,
+                    "step": 0.1,
+                }),
+                "meta_seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xFFFFFFFFFFFFFFFF,
+                }),
+                "meta_resolution": ("STRING", {
+                    "default": "",
+                    "multiline": False,
+                    "placeholder": "z.B. 1280x720",
+                }),
+                "meta_custom_notes": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "placeholder": "Eigene Notizen ...",
+                }),
+                # --- Preview ---
+                "enable_preview": ("BOOLEAN", {
+                    "default": True,
+                }),
+                "preview_max_frames": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 16,
+                    "step": 1,
+                    "display": "number",
+                }),
+                # --- Workflow PNG ---
+                "save_workflow_png": ("BOOLEAN", {
+                    "default": True,
+                }),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
             },
         }
 
@@ -69,12 +151,10 @@ class VideoCombineCustomPath:
     @staticmethod
     def _find_ffmpeg() -> str:
         """Sucht ffmpeg im System-PATH und in typischen ComfyUI-Pfaden."""
-        # 1) Normaler PATH
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
             return ffmpeg
 
-        # 2) Typische Orte in ComfyUI-Installationen (Windows)
         candidates = [
             os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe"),
             os.path.join(os.path.dirname(sys.executable), "Scripts", "ffmpeg.exe"),
@@ -109,7 +189,7 @@ class VideoCombineCustomPath:
         elif fmt == "avi (rawvideo)":
             return ["-c:v", "rawvideo", "-pix_fmt", "bgr24"]
         elif fmt == "gif":
-            return []  # GIF wird separat behandelt
+            return []
         return []
 
     @staticmethod
@@ -128,10 +208,9 @@ class VideoCombineCustomPath:
         """
         Bestimmt den Ausgabeordner.
         - Leer → ComfyUI Standard-Output
-        - Sonst → benutzerdefinierter Pfad (wird ggf. erstellt)
+        - Sonst → benutzerdefinierter Pfad
         """
         if not custom_path or custom_path.strip() == "":
-            # Fallback: ComfyUI output folder
             import folder_paths
             return folder_paths.get_output_directory()
 
@@ -153,15 +232,169 @@ class VideoCombineCustomPath:
         return resolved
 
     @staticmethod
-    def _unique_filename(directory: str, prefix: str, ext: str) -> str:
-        """Erzeugt einen eindeutigen Dateinamen (prefix_00001.ext usw.)."""
+    def _unique_filepath(directory: str, prefix: str, ext: str) -> tuple[str, str]:
+        """
+        Erzeugt einen eindeutigen Dateinamen (prefix_00001.ext usw.).
+        Gibt (voller_pfad, basis_name_ohne_ext) zurück.
+        """
         counter = 1
         while True:
-            name = f"{prefix}_{counter:05d}{ext}"
-            full = os.path.join(directory, name)
+            basename = f"{prefix}_{counter:05d}"
+            full = os.path.join(directory, f"{basename}{ext}")
             if not os.path.exists(full):
-                return full
+                return full, basename
             counter += 1
+
+    # ------------------------------------------------------------------ #
+    #  Metadata
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _save_metadata(
+        filepath_json: str,
+        video_filepath: str,
+        frame_rate: float,
+        fmt: str,
+        quality: str,
+        num_frames: int,
+        resolution: tuple,
+        model_name: str = "",
+        positive_prompt: str = "",
+        negative_prompt: str = "",
+        lora_name: str = "",
+        lora_strength: float = 1.0,
+        steps: int = 20,
+        cfg: float = 7.0,
+        seed: int = 0,
+        meta_resolution: str = "",
+        custom_notes: str = "",
+        prompt: dict = None,
+    ):
+        """Speichert Metadaten als JSON-Datei neben dem Video."""
+        metadata = {
+            "file_info": {
+                "video_file": os.path.basename(video_filepath),
+                "video_path": video_filepath,
+                "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "format": fmt,
+                "quality": quality,
+                "frame_rate": frame_rate,
+                "total_frames": num_frames,
+                "frame_resolution": f"{resolution[1]}x{resolution[0]}",
+                "duration_seconds": round(num_frames / frame_rate, 2),
+            },
+            "generation_settings": {
+                "model": model_name,
+                "positive_prompt": positive_prompt,
+                "negative_prompt": negative_prompt,
+                "lora": lora_name,
+                "lora_strength": lora_strength,
+                "steps": steps,
+                "cfg": cfg,
+                "seed": seed,
+                "resolution": meta_resolution,
+            },
+            "notes": custom_notes,
+        }
+
+        # ComfyUI Workflow-Prompt (wenn verfügbar)
+        if prompt:
+            metadata["comfyui_prompt"] = prompt
+
+        with open(filepath_json, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        print(f"[VideoCombineCustomPath] Metadata gespeichert: {filepath_json}")
+
+    # ------------------------------------------------------------------ #
+    #  Preview-Bilder erzeugen
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _generate_preview_images(
+        images: torch.Tensor,
+        output_dir: str,
+        basename: str,
+        max_frames: int = 1,
+    ) -> list[dict]:
+        """
+        Speichert Preview-Frames als PNG im ComfyUI-Output-Ordner
+        und gibt die UI-Daten für die Bildvorschau zurück.
+        """
+        from PIL import Image as PILImage
+        import folder_paths
+
+        # Preview kommt immer in den ComfyUI output-Ordner (für die UI)
+        preview_dir = folder_paths.get_output_directory()
+        preview_subfolder = "video_previews"
+        preview_path = os.path.join(preview_dir, preview_subfolder)
+        os.makedirs(preview_path, exist_ok=True)
+
+        num_frames = images.shape[0]
+        results = []
+
+        if max_frames == 1:
+            indices = [0]
+        else:
+            # Gleichmäßig verteilte Frames
+            indices = np.linspace(0, num_frames - 1, min(max_frames, num_frames),
+                                  dtype=int).tolist()
+
+        for idx, frame_idx in enumerate(indices):
+            frame_np = (images[frame_idx].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            img = PILImage.fromarray(frame_np)
+
+            preview_filename = f"{basename}_preview_{idx:03d}.png"
+            preview_filepath = os.path.join(preview_path, preview_filename)
+            img.save(preview_filepath, format="PNG")
+
+            results.append({
+                "filename": preview_filename,
+                "subfolder": preview_subfolder,
+                "type": "output",
+            })
+
+        print(f"[VideoCombineCustomPath] {len(results)} Preview-Bild(er) erzeugt")
+        return results
+
+    # ------------------------------------------------------------------ #
+    #  Workflow als PNG speichern
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _save_workflow_png(
+        images: torch.Tensor,
+        filepath_png: str,
+        prompt: dict = None,
+        extra_pnginfo: dict = None,
+    ):
+        """
+        Speichert das erste Frame als PNG mit eingebettetem ComfyUI-Workflow
+        in den tEXt-Chunks (wie ComfyUI es bei Bildern macht).
+        So kann der Workflow später per Drag & Drop wieder geladen werden.
+        """
+        from PIL import Image as PILImage
+        from PIL.PngImagePlugin import PngInfo
+
+        # Erstes Frame als Bild
+        frame_np = (images[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        img = PILImage.fromarray(frame_np)
+
+        # PNG Metadata mit Workflow-Infos
+        png_meta = PngInfo()
+
+        if prompt is not None:
+            png_meta.add_text("prompt", json.dumps(prompt))
+
+        if extra_pnginfo is not None:
+            for key, value in extra_pnginfo.items():
+                if isinstance(value, str):
+                    png_meta.add_text(key, value)
+                else:
+                    png_meta.add_text(key, json.dumps(value))
+
+        img.save(filepath_png, format="PNG", pnginfo=png_meta)
+        print(f"[VideoCombineCustomPath] Workflow-PNG gespeichert: {filepath_png}")
 
     # ------------------------------------------------------------------ #
     #  Hauptfunktion
@@ -176,28 +409,47 @@ class VideoCombineCustomPath:
         quality: str,
         custom_output_path: str,
         create_folder_if_missing: bool,
+        # Optional
         audio: Optional[dict] = None,
+        save_metadata: bool = True,
+        meta_model_name: str = "",
+        meta_positive_prompt: str = "",
+        meta_negative_prompt: str = "",
+        meta_lora_name: str = "",
+        meta_lora_strength: float = 1.0,
+        meta_steps: int = 20,
+        meta_cfg: float = 7.0,
+        meta_seed: int = 0,
+        meta_resolution: str = "",
+        meta_custom_notes: str = "",
+        enable_preview: bool = True,
+        preview_max_frames: int = 1,
+        save_workflow_png: bool = True,
+        # Hidden
+        prompt: dict = None,
+        extra_pnginfo: dict = None,
     ):
         ffmpeg = self._find_ffmpeg()
         output_dir = self._resolve_output_path(custom_output_path, create_folder_if_missing)
         ext = self._get_extension(format)
-        output_file = self._unique_filename(output_dir, filename_prefix, ext)
+        output_file, basename = self._unique_filepath(output_dir, filename_prefix, ext)
 
         # -------------------------------------------------------------- #
         #  Bilder als temporäre PNG-Sequenz schreiben
         # -------------------------------------------------------------- #
-        # images shape: (N, H, W, C)  Werte 0..1 float
         num_frames = images.shape[0]
         if num_frames == 0:
             raise ValueError("Keine Frames zum Kombinieren vorhanden!")
 
+        height, width = images.shape[1], images.shape[2]
+
         print(f"[VideoCombineCustomPath] {num_frames} Frames → {output_file}")
-        print(f"[VideoCombineCustomPath] Format: {format}, FPS: {frame_rate}, Qualität: {quality}")
+        print(f"[VideoCombineCustomPath] Format: {format}, FPS: {frame_rate}, "
+              f"Qualität: {quality}, Auflösung: {width}x{height}")
 
         tmpdir = tempfile.mkdtemp(prefix="comfyui_vccp_")
 
         try:
-            # Frames als PNG speichern
             from PIL import Image as PILImage
 
             for i in range(num_frames):
@@ -213,9 +465,8 @@ class VideoCombineCustomPath:
                 audio_path = os.path.join(tmpdir, "audio_input.wav")
                 try:
                     import torchaudio
-                    waveform = audio["waveform"]      # (batch, channels, samples)
+                    waveform = audio["waveform"]
                     sample_rate = audio["sample_rate"]
-                    # Ersten Eintrag im Batch nehmen
                     if waveform.dim() == 3:
                         waveform = waveform[0]
                     torchaudio.save(audio_path, waveform.cpu(), sample_rate)
@@ -229,9 +480,7 @@ class VideoCombineCustomPath:
             input_pattern = os.path.join(tmpdir, "frame_%06d.png")
 
             if format == "gif":
-                # GIF: Palette erzeugen für bessere Qualität
                 palette_path = os.path.join(tmpdir, "palette.png")
-                # Schritt 1: Palette
                 cmd_palette = [
                     ffmpeg, "-y",
                     "-framerate", str(frame_rate),
@@ -241,7 +490,6 @@ class VideoCombineCustomPath:
                 ]
                 subprocess.run(cmd_palette, check=True, capture_output=True)
 
-                # Schritt 2: GIF mit Palette
                 cmd_gif = [
                     ffmpeg, "-y",
                     "-framerate", str(frame_rate),
@@ -259,7 +507,6 @@ class VideoCombineCustomPath:
                     "-i", input_pattern,
                 ]
 
-                # Audio hinzufügen falls vorhanden
                 if audio_path and os.path.isfile(audio_path):
                     cmd += ["-i", audio_path, "-c:a", "aac", "-b:a", "192k"]
 
@@ -274,14 +521,66 @@ class VideoCombineCustomPath:
                     )
 
         finally:
-            # Temporäre Dateien aufräumen
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         file_size_mb = os.path.getsize(output_file) / (1024 * 1024)
-        print(f"[VideoCombineCustomPath] Fertig! {output_file} ({file_size_mb:.1f} MB)")
+        print(f"[VideoCombineCustomPath] Video fertig! {output_file} ({file_size_mb:.1f} MB)")
 
-        return {"ui": {"text": [f"Gespeichert: {output_file} ({file_size_mb:.1f} MB)"]},
-                "result": (output_file,)}
+        # -------------------------------------------------------------- #
+        #  Metadata speichern (optional)
+        # -------------------------------------------------------------- #
+        if save_metadata:
+            json_path = os.path.join(output_dir, f"{basename}_metadata.json")
+            self._save_metadata(
+                filepath_json=json_path,
+                video_filepath=output_file,
+                frame_rate=frame_rate,
+                fmt=format,
+                quality=quality,
+                num_frames=num_frames,
+                resolution=(height, width),
+                model_name=meta_model_name,
+                positive_prompt=meta_positive_prompt,
+                negative_prompt=meta_negative_prompt,
+                lora_name=meta_lora_name,
+                lora_strength=meta_lora_strength,
+                steps=meta_steps,
+                cfg=meta_cfg,
+                seed=meta_seed,
+                meta_resolution=meta_resolution,
+                custom_notes=meta_custom_notes,
+                prompt=prompt,
+            )
+
+        # -------------------------------------------------------------- #
+        #  Workflow als PNG speichern (optional)
+        # -------------------------------------------------------------- #
+        if save_workflow_png:
+            png_path = os.path.join(output_dir, f"{basename}_workflow.png")
+            self._save_workflow_png(
+                images=images,
+                filepath_png=png_path,
+                prompt=prompt,
+                extra_pnginfo=extra_pnginfo,
+            )
+
+        # -------------------------------------------------------------- #
+        #  Preview erzeugen (optional)
+        # -------------------------------------------------------------- #
+        ui_data = {
+            "text": [f"Gespeichert: {output_file} ({file_size_mb:.1f} MB)"],
+        }
+
+        if enable_preview:
+            preview_images = self._generate_preview_images(
+                images=images,
+                output_dir=output_dir,
+                basename=basename,
+                max_frames=preview_max_frames,
+            )
+            ui_data["images"] = preview_images
+
+        return {"ui": ui_data, "result": (output_file,)}
 
 
 # ====================================================================== #
