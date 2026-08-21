@@ -1,0 +1,14 @@
+[project]
+name = "comfyui-customvideosave"
+description = "Video Save Plus: MP4 with audio + workflow PNG to any folder, with reveal/open/copy/last-frame/delete buttons."
+version = "2.0.1"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Slartibart23/ComfyUI-CustomVideoSave"
+
+[tool.comfy]
+PublisherId = "Slartibart23"
+DisplayName = "Video Save Plus (Custom Path)"
+Icon = ""
