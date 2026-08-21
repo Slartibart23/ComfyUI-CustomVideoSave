@@ -1,14 +1,20 @@
 [project]
 name = "comfyui-customvideosave"
-description = "Video Save Plus: MP4 with audio + workflow PNG to any folder, with reveal/open/copy/last-frame/delete buttons."
-version = "2.0.1"
+description = "Video Combine (Custom Path): combine ComfyUI image frames into MP4/WebM/AVI/GIF and save to any folder on any drive, with optional audio, metadata JSON, preview and an embedded-workflow PNG."
+version = "1.0.0"
 license = { file = "LICENSE" }
-dependencies = []
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "pillow",
+]
 
 [project.urls]
 Repository = "https://github.com/Slartibart23/ComfyUI-CustomVideoSave"
+Documentation = "https://github.com/Slartibart23/ComfyUI-CustomVideoSave#readme"
+"Bug Tracker" = "https://github.com/Slartibart23/ComfyUI-CustomVideoSave/issues"
 
 [tool.comfy]
-PublisherId = "Slartibart23"
-DisplayName = "Video Save Plus (Custom Path)"
+PublisherId = "slartibart23b"
+DisplayName = "Video Combine (Custom Path)"
 Icon = ""
