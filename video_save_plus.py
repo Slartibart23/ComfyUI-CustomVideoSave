@@ -2,8 +2,15 @@
 ComfyUI Custom Node: Video Save Plus (Custom Path)
 
 Saves a video (MP4, H.264/H.265 + AAC) with its generated audio to any folder,
-plus a workflow PNG (first frame with embedded workflow), optional prompt .txt
-and optional first/last/all frames.
+plus a workflow PNG (first frame with embedded workflow), optional workflow
+JSON, optional prompt .txt and optional first/last/all frames.
+
+Three ways to feed it:
+- VIDEO   (native ComfyUI video object, e.g. Grok Imagine Video / MiniMax)
+- IMAGE + AUDIO
+- source_video_path (v2.1): a finished MP4 on disk is COPIED 1:1 without
+  re-encoding (audio kept). If 'audio' is connected as well, only the audio
+  track is replaced (video stream copied).
 
 Buttons on the node (session-bound, pure file operations):
 - Reveal in file manager
@@ -13,8 +20,7 @@ Buttons on the node (session-bound, pure file operations):
 - Delete Last Generation (with confirmation)
 
 No torchaudio needed: audio is piped to ffmpeg as raw float32 PCM,
-frames are piped as raw RGB24. Nothing is written to temp files except
-the audio buffer.
+frames are piped as raw RGB24.
 """
 
 import os
@@ -37,7 +43,7 @@ from PIL.PngImagePlugin import PngInfo
 
 import folder_paths
 
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 
 LOG = "[VideoSavePlus]"
 
@@ -81,6 +87,15 @@ def _find_ffmpeg() -> str:
     )
 
 
+def _find_ffprobe(ffmpeg: str) -> Optional[str]:
+    fp = shutil.which("ffprobe")
+    if fp:
+        return fp
+    exe = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+    c = os.path.join(os.path.dirname(ffmpeg), exe)
+    return c if os.path.isfile(c) else None
+
+
 def _apply_template(prefix: str, seed: Optional[int]) -> str:
     """%date%, %time%, %seed%, and ComfyUI-style %date:yyyy-MM-dd%."""
     now = datetime.now()
@@ -107,7 +122,7 @@ def _sanitize_name(name: str) -> str:
 def _resolve_output_dir(custom_path: str) -> str:
     if not custom_path or not custom_path.strip():
         return folder_paths.get_output_directory()
-    return os.path.abspath(os.path.expanduser(custom_path.strip()))
+    return os.path.abspath(os.path.expanduser(custom_path.strip().strip('"')))
 
 
 def _next_basename(directory: str, name: str) -> str:
@@ -200,6 +215,61 @@ def _components_from_video(video):
     raise TypeError(f"Unsupported VIDEO object: {type(video)}")
 
 
+def _probe_video(ffmpeg: str, path: str) -> dict:
+    """Best-effort stream info via ffprobe: width, height, fps, frames,
+    duration, audio (sr, channels) — used for passthrough status."""
+    info: dict = {}
+    ffprobe = _find_ffprobe(ffmpeg)
+    if not ffprobe:
+        return info
+    try:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries",
+             "stream=codec_type,width,height,r_frame_rate,nb_frames,sample_rate,"
+             "channels:format=duration", "-of", "json", path],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            return info
+        j = json.loads(r.stdout or "{}")
+        for st in j.get("streams", []):
+            if st.get("codec_type") == "video" and "width" not in info:
+                info["width"] = st.get("width")
+                info["height"] = st.get("height")
+                fr = st.get("r_frame_rate", "")
+                if "/" in fr:
+                    a, b = fr.split("/")
+                    info["fps"] = float(a) / float(b) if float(b) else None
+                nf = st.get("nb_frames")
+                info["frames"] = int(nf) if nf and str(nf).isdigit() else None
+            elif st.get("codec_type") == "audio" and "audio_sr" not in info:
+                info["audio_sr"] = int(st.get("sample_rate") or 0)
+                info["audio_ch"] = int(st.get("channels") or 0)
+        dur = (j.get("format") or {}).get("duration")
+        info["duration"] = float(dur) if dur else None
+    except Exception as e:
+        print(f"{LOG} ffprobe failed: {e}")
+    return info
+
+
+def _grab_frame(ffmpeg: str, video_path: str, last: bool) -> Optional[np.ndarray]:
+    """Decode the first (or last) frame of a video file to a uint8 array."""
+    tmp = tempfile.mkdtemp(prefix="comfyui_vsp_frame_")
+    try:
+        png = os.path.join(tmp, "frame.png")
+        cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        if last:
+            cmd += ["-sseof", "-1", "-i", video_path, "-update", "1"]
+        else:
+            cmd += ["-i", video_path, "-frames:v", "1"]
+        cmd += [png]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.isfile(png):
+            return None
+        return np.asarray(Image.open(png).convert("RGB")).astype(np.uint8)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _open_in_file_manager(path: str):
     system = platform.system()
     if system == "Windows":
@@ -229,7 +299,8 @@ class VideoSavePlus:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("filepath",)
     OUTPUT_NODE = True
-    DESCRIPTION = ("Saves MP4 with audio + workflow PNG to any folder. "
+    DESCRIPTION = ("Saves MP4 with audio + workflow PNG/JSON to any folder. "
+                   "VIDEO, IMAGE+AUDIO, or passthrough of a finished MP4. "
                    "Buttons: reveal, open, training copy, last frame, delete.")
 
     @classmethod
@@ -251,42 +322,50 @@ class VideoSavePlus:
                 }),
                 "frame_rate": ("FLOAT", {
                     "default": 24.0, "min": 1.0, "max": 120.0, "step": 0.01,
-                    "tooltip": "Only used for the 'images' input. With a VIDEO input the "
-                               "video's own frame rate is used automatically.",
+                    "tooltip": "Only used for the 'images' input. With a VIDEO input or "
+                               "source_video_path the video's own frame rate is used.",
                 }),
                 "video_codec": (["h264", "h265"], {
                     "default": "h264",
                     "tooltip": "h264 = plays everywhere (Windows, web, phones). "
                                "h265 = ~40% smaller at the same quality but not every "
-                               "player/browser supports it.",
+                               "player/browser supports it. Ignored in passthrough mode.",
                 }),
                 "crf": ("INT", {
                     "default": 19, "min": 0, "max": 51, "step": 1,
                     "tooltip": "Constant quality. Lower = better and larger. "
                                "0 = lossless, 17-19 = visually lossless, 23 = ffmpeg "
-                               "default, 28 = small. Main quality control.",
+                               "default, 28 = small. Main quality control. Ignored in "
+                               "passthrough mode.",
                 }),
                 "preset": (PRESETS, {
                     "default": "medium",
                     "tooltip": "Encoding speed vs. file size at the SAME quality (CRF). "
                                "Does not change picture quality. Slower = smaller file, "
-                               "longer encode.",
+                               "longer encode. Ignored in passthrough mode.",
                 }),
                 "pixel_format": (["yuv420p", "yuv444p"], {
                     "default": "yuv420p",
                     "tooltip": "yuv420p = maximum compatibility (standard). "
                                "yuv444p = full colour resolution, sharper edges/text, "
-                               "but many players and all browsers refuse to play it.",
+                               "but many players and all browsers refuse to play it. "
+                               "Ignored in passthrough mode.",
                 }),
                 "audio_bitrate": ("INT", {
                     "default": 192, "min": 64, "max": 320, "step": 32,
                     "tooltip": "AAC bitrate in kbit/s. 128 = speech, 192 = very good, "
-                               "256-320 = music/transparent.",
+                               "256-320 = music/transparent. In passthrough mode only "
+                               "used when 'audio' replaces the original track.",
                 }),
                 "save_workflow_png": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "Save the first frame as PNG with the complete workflow "
                                "embedded. Drag & drop into ComfyUI restores the workflow.",
+                }),
+                "save_workflow_json": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Also save the workflow as name.json (plain JSON, loadable "
+                               "via Workflow > Open; readable without image tools).",
                 }),
                 "png_compression": ("INT", {
                     "default": 4, "min": 0, "max": 9, "step": 1,
@@ -298,7 +377,9 @@ class VideoSavePlus:
                     "default": "none",
                     "tooltip": "Automatically save frames as images next to the video "
                                "(name_first Frame / name_last Frame / name_frame_00001). "
-                               "The 'Save Last Frame' button works independently of this.",
+                               "The 'Save Last Frame' button works independently of this. "
+                               "'all' needs frames (images/VIDEO), not available for "
+                               "passthrough without frames.",
                 }),
                 "frame_format": (["jpg", "png"], {
                     "default": "jpg",
@@ -314,20 +395,34 @@ class VideoSavePlus:
                     "default": "",
                     "placeholder": "Target folder for 'Save Training File'",
                     "tooltip": "Target folder used by the 'Save Training File' button. "
-                               "Copies mp4 + png + txt + frames with identical names.",
+                               "Copies mp4 + png + json + txt + frames with identical names.",
                 }),
             },
             "optional": {
                 "video": ("VIDEO", {
-                    "tooltip": "VIDEO output of models with native audio (e.g. MiniMax). "
-                               "Frames, audio and frame rate are taken from it. "
+                    "tooltip": "VIDEO output of models/nodes with native audio (e.g. Grok "
+                               "Imagine Video, MiniMax). Frames, audio and frame rate are "
+                               "taken from it and RE-ENCODED with the settings above. "
                                "A connected 'audio' input overrides its audio track.",
                 }),
                 "images": ("IMAGE", {
-                    "tooltip": "Frames as IMAGE batch (used when no VIDEO is connected).",
+                    "tooltip": "Frames as IMAGE batch (used when no VIDEO is connected). "
+                               "In passthrough mode optional: only used for the PNG/frames.",
                 }),
                 "audio": ("AUDIO", {
-                    "tooltip": "Audio track. Overrides the audio contained in a VIDEO input.",
+                    "tooltip": "Audio track. Overrides the audio contained in a VIDEO "
+                               "input. In passthrough mode it REPLACES the file's own "
+                               "soundtrack (video stream is still copied, not re-encoded).",
+                }),
+                "source_video_path": ("STRING", {
+                    "default": "",
+                    "placeholder": "connect video_path of Grok Imagine Video, or type a path",
+                    "tooltip": "PASSTHROUGH: path of a finished MP4 (e.g. the video_path "
+                               "output of Grok Imagine Video). The file is copied 1:1 to "
+                               "the destination - no re-encoding, no quality loss, audio "
+                               "kept - and renamed/numbered like everything else. "
+                               "Codec/CRF/preset/pixel_format are ignored. Leave "
+                               "unconnected to encode video/images as usual.",
                 }),
                 "prompt_text": ("STRING", {
                     "forceInput": True,
@@ -351,11 +446,15 @@ class VideoSavePlus:
     def save(self, filename_prefix, custom_output_path, frame_rate, video_codec,
              crf, preset, pixel_format, audio_bitrate, save_workflow_png,
              png_compression, save_frame, frame_format, frame_quality,
-             copy_to_folder="", video=None, images=None, audio=None,
-             prompt_text=None, seed=None, prompt=None, extra_pnginfo=None,
-             unique_id=None):
+             copy_to_folder="", save_workflow_json=False, video=None,
+             images=None, audio=None, source_video_path=None, prompt_text=None,
+             seed=None, prompt=None, extra_pnginfo=None, unique_id=None):
 
         ffmpeg = _find_ffmpeg()
+        source = (source_video_path or "").strip().strip('"')
+        passthrough = bool(source)
+        if passthrough and not os.path.isfile(source):
+            raise FileNotFoundError(f"{LOG} source_video_path not found: {source}")
 
         # ---------------- collect frames / audio / fps ----------------
         fps = float(frame_rate)
@@ -367,10 +466,10 @@ class VideoSavePlus:
             images = v_images
             if v_fps:
                 fps = v_fps
-        if images is None or images.shape[0] == 0:
-            raise ValueError(f"{LOG} Connect either 'video' or 'images'.")
+        if not passthrough and (images is None or images.shape[0] == 0):
+            raise ValueError(f"{LOG} Connect 'video', 'images', or 'source_video_path'.")
 
-        audio_src = audio if audio is not None else video_audio
+        audio_src = audio if audio is not None else (None if passthrough else video_audio)
         audio_data = None
         audio_info = "no audio"
         if audio_src is not None:
@@ -382,9 +481,6 @@ class VideoSavePlus:
                 ch_name = {1: "mono", 2: "stereo"}.get(a_ch, f"{a_ch} ch")
                 audio_info = f"{a_sr} Hz {ch_name}, {a_sec:.2f} s"
 
-        num_frames, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
-        duration = num_frames / fps
-
         # ---------------- resolve paths ----------------
         out_root = _resolve_output_dir(custom_output_path)
         templated = _apply_template(filename_prefix, seed)
@@ -395,70 +491,110 @@ class VideoSavePlus:
         base = _next_basename(out_dir, name)
         video_path = os.path.join(out_dir, base + ".mp4")
 
-        print(f"{LOG} {num_frames} frames {width}x{height} @ {fps:.3f} fps "
-              f"({duration:.2f} s) -> {video_path}")
-        print(f"{LOG} audio: {audio_info}")
-
-        # ---------------- encode ----------------
         tmpdir = tempfile.mkdtemp(prefix="comfyui_vsp_")
         stderr_path = os.path.join(tmpdir, "ffmpeg_stderr.txt")
         try:
-            cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
-                   "-r", f"{fps:.6f}", "-i", "pipe:0"]
-
             audio_raw_path = None
             if audio_data is not None:
                 raw, a_sr, a_ch, _ = audio_data
                 audio_raw_path = os.path.join(tmpdir, "audio.f32le")
                 with open(audio_raw_path, "wb") as f:
                     f.write(raw)
-                cmd += ["-f", "f32le", "-ar", str(a_sr), "-ac", str(a_ch),
-                        "-i", audio_raw_path]
 
-            cmd += ["-map", "0:v:0"]
-            if audio_raw_path:
-                cmd += ["-map", "1:a:0"]
+            if passthrough:
+                # ---------------- PASSTHROUGH: copy / remux ----------------
+                print(f"{LOG} passthrough {source} -> {video_path}")
+                if audio_raw_path:
+                    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                           "-i", source,
+                           "-f", "f32le", "-ar", str(a_sr), "-ac", str(a_ch),
+                           "-i", audio_raw_path,
+                           "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                           "-c:a", "aac", "-b:a", f"{int(audio_bitrate)}k",
+                           "-movflags", "+faststart", "-shortest", video_path]
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    if r.returncode != 0 or not os.path.isfile(video_path):
+                        raise RuntimeError(f"{LOG} ffmpeg remux failed (code "
+                                           f"{r.returncode}):\n{(r.stderr or '')[-3000:]}")
+                    print(f"{LOG} video stream copied, audio replaced")
+                else:
+                    shutil.copy2(source, video_path)
 
-            vf = []
-            if pixel_format == "yuv420p" and (width % 2 or height % 2):
-                vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-                print(f"{LOG} odd dimensions -> scaled to even size for yuv420p")
-            if vf:
-                cmd += ["-vf", ",".join(vf)]
-
-            if video_codec == "h265":
-                cmd += ["-c:v", "libx265", "-tag:v", "hvc1",
-                        "-x265-params", "log-level=error"]
+                probe = _probe_video(ffmpeg, video_path)
+                width = probe.get("width") or (int(images.shape[2]) if images is not None else 0)
+                height = probe.get("height") or (int(images.shape[1]) if images is not None else 0)
+                fps = probe.get("fps") or fps
+                num_frames = probe.get("frames") or (int(images.shape[0]) if images is not None else 0)
+                duration = probe.get("duration") or (num_frames / fps if fps else 0.0)
+                if audio_data is None:
+                    if probe.get("audio_sr"):
+                        ch_name = {1: "mono", 2: "stereo"}.get(probe.get("audio_ch"),
+                                                               f"{probe.get('audio_ch')} ch")
+                        audio_info = f"{probe['audio_sr']} Hz {ch_name} (original track kept)"
+                        has_audio = True
+                    else:
+                        audio_info = "no audio track in source file"
+                        has_audio = False
+                else:
+                    has_audio = True
+                print(f"{LOG} {num_frames} frames {width}x{height} @ {fps:.3f} fps "
+                      f"({duration:.2f} s), audio: {audio_info}")
             else:
-                cmd += ["-c:v", "libx264"]
-            cmd += ["-crf", str(int(crf)), "-preset", preset,
-                    "-pix_fmt", pixel_format, "-movflags", "+faststart"]
+                # ---------------- ENCODE frames ----------------
+                num_frames, height, width = int(images.shape[0]), int(images.shape[1]), int(images.shape[2])
+                duration = num_frames / fps
+                has_audio = audio_data is not None
+                print(f"{LOG} {num_frames} frames {width}x{height} @ {fps:.3f} fps "
+                      f"({duration:.2f} s) -> {video_path}")
+                print(f"{LOG} audio: {audio_info}")
 
-            if audio_raw_path:
-                cmd += ["-c:a", "aac", "-b:a", f"{int(audio_bitrate)}k", "-shortest"]
+                cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                       "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}",
+                       "-r", f"{fps:.6f}", "-i", "pipe:0"]
+                if audio_raw_path:
+                    cmd += ["-f", "f32le", "-ar", str(a_sr), "-ac", str(a_ch),
+                            "-i", audio_raw_path]
+                cmd += ["-map", "0:v:0"]
+                if audio_raw_path:
+                    cmd += ["-map", "1:a:0"]
 
-            cmd += [video_path]
+                vf = []
+                if pixel_format == "yuv420p" and (width % 2 or height % 2):
+                    vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+                    print(f"{LOG} odd dimensions -> scaled to even size for yuv420p")
+                if vf:
+                    cmd += ["-vf", ",".join(vf)]
 
-            with open(stderr_path, "wb") as errf:
-                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                        stdout=subprocess.DEVNULL, stderr=errf)
-                try:
-                    for i in range(num_frames):
-                        proc.stdin.write(_tensor_frame_to_uint8(images[i]).tobytes())
-                except BrokenPipeError:
-                    pass
-                finally:
+                if video_codec == "h265":
+                    cmd += ["-c:v", "libx265", "-tag:v", "hvc1",
+                            "-x265-params", "log-level=error"]
+                else:
+                    cmd += ["-c:v", "libx264"]
+                cmd += ["-crf", str(int(crf)), "-preset", preset,
+                        "-pix_fmt", pixel_format, "-movflags", "+faststart"]
+                if audio_raw_path:
+                    cmd += ["-c:a", "aac", "-b:a", f"{int(audio_bitrate)}k", "-shortest"]
+                cmd += [video_path]
+
+                with open(stderr_path, "wb") as errf:
+                    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                            stdout=subprocess.DEVNULL, stderr=errf)
                     try:
-                        proc.stdin.close()
-                    except Exception:
+                        for i in range(num_frames):
+                            proc.stdin.write(_tensor_frame_to_uint8(images[i]).tobytes())
+                    except BrokenPipeError:
                         pass
-                    proc.wait()
+                    finally:
+                        try:
+                            proc.stdin.close()
+                        except Exception:
+                            pass
+                        proc.wait()
 
-            if proc.returncode != 0 or not os.path.isfile(video_path):
-                with open(stderr_path, "r", errors="replace") as f:
-                    err = f.read()[-3000:]
-                raise RuntimeError(f"{LOG} ffmpeg failed (code {proc.returncode}):\n{err}")
+                if proc.returncode != 0 or not os.path.isfile(video_path):
+                    with open(stderr_path, "r", errors="replace") as f:
+                        err = f.read()[-3000:]
+                    raise RuntimeError(f"{LOG} ffmpeg failed (code {proc.returncode}):\n{err}")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -467,19 +603,37 @@ class VideoSavePlus:
 
         files = [video_path]
 
-        # ---------------- workflow PNG ----------------
-        first_arr = _tensor_frame_to_uint8(images[0])
-        last_arr = _tensor_frame_to_uint8(images[-1])
+        # ---------------- first / last frame arrays ----------------
+        if images is not None and images.shape[0] > 0:
+            first_arr = _tensor_frame_to_uint8(images[0])
+            last_arr = _tensor_frame_to_uint8(images[-1])
+        else:  # passthrough without frames: decode from the file
+            first_arr = _grab_frame(ffmpeg, video_path, last=False)
+            last_arr = _grab_frame(ffmpeg, video_path, last=True)
+
+        # ---------------- workflow PNG / JSON ----------------
         if save_workflow_png:
-            meta = PngInfo()
-            if prompt is not None:
-                meta.add_text("prompt", json.dumps(prompt))
-            if extra_pnginfo:
-                for k, v in extra_pnginfo.items():
-                    meta.add_text(k, v if isinstance(v, str) else json.dumps(v))
-            png_path = os.path.join(out_dir, base + ".png")
-            _save_image(first_arr, png_path, "png", 100, png_compression, meta)
-            files.append(png_path)
+            if first_arr is not None:
+                meta = PngInfo()
+                if prompt is not None:
+                    meta.add_text("prompt", json.dumps(prompt))
+                if extra_pnginfo:
+                    for k, v in extra_pnginfo.items():
+                        meta.add_text(k, v if isinstance(v, str) else json.dumps(v))
+                png_path = os.path.join(out_dir, base + ".png")
+                _save_image(first_arr, png_path, "png", 100, png_compression, meta)
+                files.append(png_path)
+            else:
+                print(f"{LOG} no frame available - workflow PNG skipped")
+
+        if save_workflow_json:
+            wf = extra_pnginfo.get("workflow") if isinstance(extra_pnginfo, dict) else None
+            if wf is not None or prompt is not None:
+                json_path = os.path.join(out_dir, base + ".json")
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(wf if wf is not None else {"prompt": prompt}, f,
+                              indent=2, ensure_ascii=False)
+                files.append(json_path)
 
         # ---------------- prompt txt ----------------
         if prompt_text is not None and str(prompt_text).strip():
@@ -490,20 +644,23 @@ class VideoSavePlus:
 
         # ---------------- frames ----------------
         ext = "." + frame_format
-        if save_frame in ("first", "first+last"):
+        if save_frame in ("first", "first+last") and first_arr is not None:
             p = os.path.join(out_dir, base + FIRST_SUFFIX + ext)
             _save_image(first_arr, p, frame_format, frame_quality, png_compression)
             files.append(p)
-        if save_frame in ("last", "first+last"):
+        if save_frame in ("last", "first+last") and last_arr is not None:
             p = os.path.join(out_dir, base + LAST_SUFFIX + ext)
             _save_image(last_arr, p, frame_format, frame_quality, png_compression)
             files.append(p)
         if save_frame == "all":
-            for i in range(num_frames):
-                p = os.path.join(out_dir, f"{base}_frame_{i + 1:05d}{ext}")
-                _save_image(_tensor_frame_to_uint8(images[i]), p, frame_format,
-                            frame_quality, png_compression)
-                files.append(p)
+            if images is not None:
+                for i in range(int(images.shape[0])):
+                    p = os.path.join(out_dir, f"{base}_frame_{i + 1:05d}{ext}")
+                    _save_image(_tensor_frame_to_uint8(images[i]), p, frame_format,
+                                frame_quality, png_compression)
+                    files.append(p)
+            else:
+                print(f"{LOG} save_frame=all needs 'images' or 'video' - skipped")
 
         # ---------------- remember for buttons ----------------
         node_key = str(unique_id) if unique_id is not None else "default"
@@ -531,12 +688,14 @@ class VideoSavePlus:
             "duration": round(duration, 2),
             "resolution": f"{width}x{height}",
             "audio": audio_info,
-            "has_audio": audio_data is not None,
+            "has_audio": has_audio,
+            "passthrough": passthrough,
             "files": [os.path.basename(f) for f in files],
         }
+        mode = " | passthrough" if passthrough else ""
         return {
             "ui": {
-                "text": [f"{base}.mp4 ({size_mb:.1f} MB) | audio: {audio_info}"],
+                "text": [f"{base}.mp4 ({size_mb:.1f} MB) | audio: {audio_info}{mode}"],
                 "vsp_status": [status],
             },
             "result": (video_path,),

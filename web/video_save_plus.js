@@ -148,7 +148,8 @@ app.registerExtension({
             this._vspStatus = s;
 
             const { line1, line2, video } = this._vspUI;
-            line1.textContent = `${s.base}.mp4 · ${s.resolution} · ${s.frames} fr @ ${s.fps} fps · ${s.duration}s · ${s.size_mb} MB`;
+            const mode = s.passthrough ? " · passthrough (no re-encode)" : "";
+            line1.textContent = `${s.base}.mp4 · ${s.resolution} · ${s.frames} fr @ ${s.fps} fps · ${s.duration}s · ${s.size_mb} MB${mode}`;
             line1.title = s.video;
             if (s.has_audio) {
                 line2.textContent = `✓ Audio: ${s.audio}`;
